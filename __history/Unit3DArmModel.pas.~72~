@@ -1,0 +1,514 @@
+unit Unit3DArmModel;
+
+interface
+
+uses
+  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, Vcl.Graphics,
+  Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.StdCtrls, Vcl.ExtCtrls,
+  VclTee.TeeGDIPlus, VCLTee.TeEngine, VCLTee.TeeProcs, VCLTee.Chart,
+  VCLTee.Series, Vcl.Buttons, Vcl.ComCtrls,
+  opengl, math;
+
+type
+  TSimMode = (smKinematic, smPhysics);
+  TPhysicsStateVector = array[0..5] of Double;
+
+  TForm1 = class(TForm)
+    Timer1: TTimer;
+    btnStartStop: TButton;
+    btnReset: TButton;
+    Panel2: TPanel;
+    pnlOpenGL: TPanel;
+    GroupBox1: TGroupBox;
+    rgMode: TRadioGroup;
+    GroupBox2: TGroupBox;
+    ChartTrajectories: TChart;
+    Series1: TLineSeries;
+    Series2: TLineSeries;
+    Series3: TLineSeries;
+    ListBoxLog: TListBox;
+    BitBtnExit: TBitBtn;
+    ScrollBox1: TScrollBox;
+    GroupBox3: TGroupBox;
+    TrackBarPitch: TTrackBar;
+    TrackBarYaw: TTrackBar;
+    TrackBarRoll: TTrackBar;
+    Label1: TLabel;
+    Label2: TLabel;
+    Label3: TLabel;
+    lblPitchValue: TLabel;
+    lblYawValue: TLabel;
+    lblRollValue: TLabel;
+    cbShowAxes: TCheckBox;
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+    procedure FormResize(Sender: TObject);
+    procedure Timer1Timer(Sender: TObject);
+    procedure btnStartStopClick(Sender: TObject);
+    procedure btnResetClick(Sender: TObject);
+    procedure rgModeClick(Sender: TObject);
+    procedure BitBtnExitClick(Sender: TObject);
+    procedure TrackBarPitchChange(Sender: TObject);
+    procedure TrackBarYawChange(Sender: TObject);
+    procedure TrackBarRollChange(Sender: TObject);
+    procedure cbShowAxesChange(Sender: TObject);
+  private
+    { Private Declarations }
+    myDC : HDC;
+    myRC : HGLRC;
+    CurrentMode: TSimMode;
+    PhysicsState: TPhysicsStateVector;
+    time: Double;
+    shoulder_yaw_deg, shoulder_pitch_deg, shoulder_roll_deg: Double;
+    elbow_pitch_deg: Double;
+    wrist_roll_deg, wrist_yaw_deg, wrist_pitch_deg: Double;
+    camera_pitch_deg, camera_yaw_deg, camera_roll_deg: Double;
+    TrajectorySeries: array of TLineSeries;
+    FontListBase: GLuint;
+
+    procedure SetupPixelFormat(ADc: HDC);
+    procedure BuildFont;
+    procedure RenderText(x, y, z: GLfloat; const text: string);
+    procedure DrawScene;
+    procedure DrawAxes;
+    procedure DrawTrajectoryArcs;
+    procedure DrawHandAndFingers;
+    procedure DrawCube(size: GLfloat);
+    procedure InitializeState;
+    procedure GetAccelerations(const AState: TPhysicsStateVector; var ADerivs: TPhysicsStateVector);
+    procedure RungeKutta4_Step(var AState: TPhysicsStateVector; ATimeStep: Double);
+    procedure UpdateCameraLabels;
+  public
+    { Public Declarations }
+  end;
+
+const
+  grav = 9.81;
+  l1 = 0.2976; m1 = 1.68; r1 = 0.1298; I1 = 0.0154;
+  l2 = 0.2336; m2 = 0.96; r2 = 0.1004; I2 = 0.0048;
+  l3 = 0.087;
+  DAMPING_SHOULDER = 0.05; DAMPING_ELBOW = 0.02;
+  DT = 0.02;
+
+var
+  Form1: TForm1;
+  Sphere, Cylinder: GLUquadricObj;
+
+implementation
+
+{$R *.dfm}
+
+procedure TForm1.SetupPixelFormat(ADc: HDC);
+var pfd: TPixelFormatDescriptor; nPixelFormat: Integer;
+begin
+  FillChar(pfd, SizeOf(pfd), 0); pfd.nSize := SizeOf(pfd); pfd.nVersion := 1;
+  pfd.dwFlags := PFD_DRAW_TO_WINDOW or PFD_SUPPORT_OPENGL or PFD_DOUBLEBUFFER;
+  pfd.iPixelType := PFD_TYPE_RGBA; pfd.cColorBits := 32; pfd.cDepthBits := 32;
+  pfd.iLayerType := PFD_MAIN_PLANE;
+  nPixelFormat := ChoosePixelFormat(ADc, @pfd);
+  SetPixelFormat(ADc, nPixelFormat, @pfd);
+end;
+
+procedure TForm1.GetAccelerations(const AState: TPhysicsStateVector; var ADerivs: TPhysicsStateVector);
+var
+  p_d, t1, t1_d, t2, t2_d: Double; c1, s1, c2, s2: Double;
+  M11, M22, M33, M23, M32: Double; F1, F2, F3: Double;
+  C1_force, C2_force, C3_force: Double;
+  G1_force, G2_force, G3_force: Double;
+  det: Double;
+begin
+  p_d  := AState[1]; t1  := AState[2]; t1_d := AState[3];
+  t2  := AState[4]; t2_d := AState[5];
+  c1 := Cos(t1); s1 := Sin(t1); c2 := Cos(t2); s2 := Sin(t2);
+  M11 := m1*Sqr(r1*s1) + m2*Sqr(l1*s1 + r2*Sin(t1+t2)) + I1*Sqr(s1) + I2*Sqr(Sin(t1+t2));
+  M22 := m1*Sqr(r1) + m2*(Sqr(l1) + Sqr(r2) + 2*l1*r2*c2) + I1 + I2;
+  M33 := m2*Sqr(r2) + I2; M23 := m2*(Sqr(r2) + l1*r2*c2) + I2; M32 := M23;
+  C1_force := (I1+m1*Sqr(r1))*p_d*t1_d*Sin(2*t1) + (I2+m2*Sqr(r2))*p_d*(t1_d+t2_d)*Sin(2*(t1+t2));
+  C2_force := -0.5*(I1+m1*Sqr(r1))*Sqr(p_d)*Sin(2*t1) - 0.5*(I2+m2*Sqr(r2))*Sqr(p_d)*Sin(2*(t1+t2)) - m2*l1*r2*s2*(Sqr(t2_d) + 2*t1_d*t2_d);
+  C3_force := 0.5*m2*l1*r2*Sqr(t1_d)*s2;
+  G1_force := 0;
+  G2_force := -(m1*r1 + m2*l1)*grav*c1 - m2*r2*grav*Cos(t1+t2);
+  G3_force := -m2*r2*grav*Cos(t1+t2);
+  F1 := -C1_force - G1_force - DAMPING_SHOULDER * p_d;
+  F2 := -C2_force - G2_force - DAMPING_SHOULDER * t1_d;
+  F3 := -C3_force - G3_force - DAMPING_ELBOW    * t2_d;
+  det := M11*(M22*M33 - M23*M32);
+  if Abs(det) < 1e-9 then begin FillChar(ADerivs, SizeOf(ADerivs), 0); Exit; end;
+  ADerivs[1] := (F1*(M22*M33-M23*M32)) / det;
+  ADerivs[3] := (F2*M33 - F3*M23) / (M22*M33 - M23*M32);
+  ADerivs[5] := (F3*M22 - F2*M32) / (M22*M33 - M23*M32);
+  ADerivs[0] := p_d; ADerivs[2] := t1_d; ADerivs[4] := t2_d;
+end;
+
+procedure TForm1.RungeKutta4_Step(var AState: TPhysicsStateVector; ATimeStep: Double);
+var
+  k1, k2, k3, k4, tempState: TPhysicsStateVector; i: Integer;
+begin
+  GetAccelerations(AState, k1);
+  for i := 0 to 5 do tempState[i] := AState[i] + 0.5 * ATimeStep * k1[i];
+  GetAccelerations(tempState, k2);
+  for i := 0 to 5 do tempState[i] := AState[i] + 0.5 * ATimeStep * k2[i];
+  GetAccelerations(tempState, k3);
+  for i := 0 to 5 do tempState[i] := AState[i] + ATimeStep * k3[i];
+  GetAccelerations(tempState, k4);
+  for i := 0 to 5 do
+    AState[i] := AState[i] + (ATimeStep / 6.0) * (k1[i] + 2*k2[i] + 2*k3[i] + k4[i]);
+end;
+
+procedure TForm1.BuildFont;
+var hFont: Winapi.Windows.HFONT;
+begin
+  FontListBase := glGenLists(256);
+  hFont := CreateFont(-12, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET,
+    OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+    FF_DONTCARE or DEFAULT_PITCH, 'Arial');
+  SelectObject(myDC, hFont);
+  wglUseFontBitmaps(myDC, 0, 255, FontListBase);
+  DeleteObject(hFont);
+end;
+
+procedure TForm1.RenderText(x, y, z: GLfloat; const text: string);
+begin
+  glRasterPos3f(x, y, z); glPushAttrib(GL_LIST_BIT);
+  glListBase(FontListBase);
+  glCallLists(Length(text), GL_UNSIGNED_BYTE, PAnsiChar(AnsiString(text)));
+  glPopAttrib();
+end;
+
+procedure TForm1.DrawCube(size: GLfloat);
+var s: GLfloat;
+begin
+  s := size / 2.0; glBegin(GL_QUADS);
+  glNormal3f(0,0,1); glVertex3f(-s,-s,s); glVertex3f(s,-s,s); glVertex3f(s,s,s); glVertex3f(-s,s,s);
+  glNormal3f(0,0,-1); glVertex3f(-s,-s,-s); glVertex3f(-s,s,-s); glVertex3f(s,s,-s); glVertex3f(s,-s,-s);
+  glNormal3f(0,1,0); glVertex3f(-s,s,-s); glVertex3f(-s,s,s); glVertex3f(s,s,s); glVertex3f(s,s,-s);
+  glNormal3f(0,-1,0); glVertex3f(-s,-s,-s); glVertex3f(s,-s,-s); glVertex3f(s,-s,s); glVertex3f(-s,-s,s);
+  glNormal3f(1,0,0); glVertex3f(s,-s,-s); glVertex3f(s,s,-s); glVertex3f(s,s,s); glVertex3f(s,-s,s);
+  glNormal3f(-1,0,0); glVertex3f(-s,-s,-s); glVertex3f(-s,-s,s); glVertex3f(-s,s,s); glVertex3f(-s,s,-s);
+  glEnd();
+end;
+
+procedure TForm1.DrawHandAndFingers;
+const mcp_bend = 20.0; pip_bend = 30.0; dip_bend = 10.0;
+var i: integer;
+begin
+  glPushMatrix(); glColor3f(1.0, 0.85, 0.7);
+  glPushMatrix(); glScalef(0.09, 0.025, 0.09); DrawCube(1.0); glPopMatrix();
+  for i := 0 to 3 do begin
+    glPushMatrix();
+      case i of 0: glTranslatef(-0.035,0,0.045); 1: glTranslatef(-0.01,0,0.05);
+        2: glTranslatef(0.015,0,0.045); 3: glTranslatef(0.04,0,0.04); end;
+      glRotatef(mcp_bend,1,0,0);
+      case i of 0: gluCylinder(Cylinder,0.008,0.007,0.045,16,1); 1: gluCylinder(Cylinder,0.009,0.008,0.05,16,1);
+        2: gluCylinder(Cylinder,0.008,0.007,0.045,16,1); 3: gluCylinder(Cylinder,0.007,0.006,0.035,16,1); end;
+      case i of 0: glTranslatef(0,0,0.045); 1: glTranslatef(0,0,0.05);
+        2: glTranslatef(0,0,0.045); 3: glTranslatef(0,0,0.035); end;
+      glRotatef(pip_bend,1,0,0);
+      case i of 0: gluCylinder(Cylinder,0.007,0.006,0.025,16,1); 1: gluCylinder(Cylinder,0.008,0.007,0.03,16,1);
+        2: gluCylinder(Cylinder,0.007,0.006,0.028,16,1); 3: gluCylinder(Cylinder,0.006,0.005,0.022,16,1); end;
+      case i of 0: glTranslatef(0,0,0.025); 1: glTranslatef(0,0,0.03);
+        2: glTranslatef(0,0,0.028); 3: glTranslatef(0,0,0.022); end;
+      glRotatef(dip_bend,1,0,0);
+      case i of 0: gluCylinder(Cylinder,0.006,0.005,0.02,16,1); 1: gluCylinder(Cylinder,0.007,0.006,0.025,16,1);
+        2: gluCylinder(Cylinder,0.006,0.005,0.022,16,1); 3: gluCylinder(Cylinder,0.005,0.004,0.018,16,1); end;
+    glPopMatrix();
+  end;
+  glPushMatrix();
+    glTranslatef(-0.05,0,0.01); glRotatef(45,0,1,0); glRotatef(mcp_bend,1,0,0);
+    gluCylinder(Cylinder,0.01,0.009,0.04,16,1);
+    glTranslatef(0,0,0.04); glRotatef(pip_bend,1,0,0);
+    gluCylinder(Cylinder,0.009,0.008,0.035,16,1);
+  glPopMatrix();
+  glPopMatrix();
+end;
+
+procedure TForm1.DrawAxes;
+const AXIS_LENGTH = 100.0;
+begin
+  glLineWidth(2.0); glDisable(GL_LIGHTING); glBegin(GL_LINES);
+  glColor3f(1,0,0); glVertex3f(-AXIS_LENGTH,0,0); glVertex3f(AXIS_LENGTH,0,0);
+  glColor3f(0,1,0); glVertex3f(0,-AXIS_LENGTH,0); glVertex3f(0,AXIS_LENGTH,0);
+  glColor3f(0,0,1); glVertex3f(0,0,-AXIS_LENGTH); glVertex3f(0,0,AXIS_LENGTH);
+  glEnd();
+  glColor3f(1,0,0); RenderText(0.6,0,0,'X'); glColor3f(0,1,0); RenderText(0,0.6,0,'Y');
+  glColor3f(0,0,1); RenderText(0,0,0.6,'Z');
+  glEnable(GL_LIGHTING); glLineWidth(1.0);
+end;
+
+procedure TForm1.DrawTrajectoryArcs;
+const ARC_RADIUS = 0.1;
+var i: Integer; angle: Double;
+begin
+  glLineWidth(1.5); glDisable(GL_LIGHTING); glLineStipple(1,$AAAA); glEnable(GL_LINE_STIPPLE);
+  glPushMatrix();
+    glColor3f(0.5,0.5,1); glBegin(GL_LINE_STRIP);
+    for i := 0 to abs(Round(shoulder_yaw_deg)) do begin angle := DegToRad(i*Sign(shoulder_yaw_deg));
+      glVertex3f(ARC_RADIUS*Sin(angle),-ARC_RADIUS*Cos(angle),0); end; glEnd();
+    RenderText(ARC_RADIUS*1.1*Sin(DegToRad(shoulder_yaw_deg)),-ARC_RADIUS*1.1*Cos(DegToRad(shoulder_yaw_deg)),0, Format('%.1f',[shoulder_yaw_deg]));
+    glRotatef(shoulder_yaw_deg,0,0,1);
+    glColor3f(1,0.5,0.5); glBegin(GL_LINE_STRIP);
+    for i := 0 to abs(Round(shoulder_pitch_deg)) do begin angle := DegToRad(i*Sign(shoulder_pitch_deg));
+      glVertex3f(ARC_RADIUS*Sin(angle),0,ARC_RADIUS*Cos(angle)); end; glEnd();
+    RenderText(ARC_RADIUS*1.1*Sin(DegToRad(shoulder_pitch_deg)),0,ARC_RADIUS*1.1*Cos(DegToRad(shoulder_pitch_deg)), Format('%.1f',[shoulder_pitch_deg]));
+    if CurrentMode = smKinematic then begin
+      glRotatef(shoulder_pitch_deg,0,1,0);
+      glColor3f(1,1,0.5); glBegin(GL_LINE_STRIP);
+      for i := 0 to abs(Round(shoulder_roll_deg)) do begin angle := DegToRad(i*Sign(shoulder_roll_deg));
+        glVertex3f(0,ARC_RADIUS*Sin(angle),ARC_RADIUS*Cos(angle)); end; glEnd();
+      RenderText(0,ARC_RADIUS*1.1*Sin(DegToRad(shoulder_roll_deg)),ARC_RADIUS*1.1*Cos(DegToRad(shoulder_roll_deg)), Format('%.1f',[shoulder_roll_deg]));
+    end;
+  glPopMatrix();
+  glPushMatrix();
+    glRotatef(shoulder_yaw_deg,0,0,1); glRotatef(shoulder_pitch_deg,0,1,0);
+    glRotatef(shoulder_roll_deg,1,0,0); glTranslatef(0,0,l1);
+    glColor3f(1,0.5,0.5); glBegin(GL_LINE_STRIP);
+    for i := 0 to abs(Round(elbow_pitch_deg)) do begin angle := DegToRad(i*Sign(elbow_pitch_deg));
+      glVertex3f(ARC_RADIUS*Sin(angle),0,ARC_RADIUS*Cos(angle)); end; glEnd();
+    RenderText(ARC_RADIUS*1.1*Sin(DegToRad(elbow_pitch_deg)),0,ARC_RADIUS*1.1*Cos(DegToRad(elbow_pitch_deg)), Format('%.1f',[elbow_pitch_deg]));
+    if CurrentMode=smKinematic then begin
+      glRotatef(elbow_pitch_deg,0,1,0); glTranslatef(0,0,l2);
+      glColor3f(1,1,0.5); glBegin(GL_LINE_STRIP);
+      for i := 0 to abs(Round(wrist_roll_deg)) do begin angle := DegToRad(i*Sign(wrist_roll_deg));
+        glVertex3f(0,ARC_RADIUS*Sin(angle),ARC_RADIUS*Cos(angle)); end; glEnd();
+      RenderText(0,ARC_RADIUS*1.1*Sin(DegToRad(wrist_roll_deg)),ARC_RADIUS*1.1*Cos(DegToRad(wrist_roll_deg)), Format('%.1f',[wrist_roll_deg]));
+      glRotatef(wrist_roll_deg,1,0,0);
+      glColor3f(0.5,1,0.5); glBegin(GL_LINE_STRIP);
+      for i := 0 to abs(Round(wrist_yaw_deg)) do begin angle := DegToRad(i*Sign(wrist_yaw_deg));
+        glVertex3f(ARC_RADIUS*Sin(angle),0,ARC_RADIUS*Cos(angle)); end; glEnd();
+      RenderText(ARC_RADIUS*1.1*Sin(DegToRad(wrist_yaw_deg)),0,ARC_RADIUS*1.1*Cos(DegToRad(wrist_yaw_deg)), Format('%.1f',[wrist_yaw_deg]));
+      glRotatef(wrist_yaw_deg,0,1,0);
+      glColor3f(1,0.5,0.5); glBegin(GL_LINE_STRIP);
+      for i := 0 to abs(Round(wrist_pitch_deg)) do begin angle := DegToRad(i*Sign(wrist_pitch_deg));
+        glVertex3f(0,ARC_RADIUS*Sin(angle),ARC_RADIUS*Cos(angle)); end; glEnd();
+      RenderText(0,ARC_RADIUS*1.1*Sin(DegToRad(wrist_pitch_deg)),ARC_RADIUS*1.1*Cos(DegToRad(wrist_pitch_deg)), Format('%.1f',[wrist_pitch_deg]));
+    end;
+  glPopMatrix();
+  glDisable(GL_LINE_STIPPLE); glEnable(GL_LIGHTING); glLineWidth(1.0);
+end;
+
+procedure TForm1.DrawScene;
+begin
+  glClearColor(0.1,0.1,0.2,1); glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT);
+  glLoadIdentity();
+  glTranslatef(0,0,-2.5);
+  glRotatef(camera_pitch_deg,1,0,0);
+  glRotatef(camera_yaw_deg,0,1,0);
+  glRotatef(camera_roll_deg,0,0,1);
+  if cbShowAxes.Checked then DrawAxes;
+
+  glPushMatrix();
+    glTranslatef(0,0.5,0);
+    if cbShowAxes.Checked then DrawTrajectoryArcs;
+    glRotatef(90, 1, 0, 0); // Orient base to hang down Y-axis
+
+    glColor3f(0.8,0.8,0.8); gluSphere(Sphere,0.05,32,32);
+    glRotatef(shoulder_yaw_deg,0,0,1);
+    glRotatef(shoulder_pitch_deg,0,1,0);
+    glRotatef(shoulder_roll_deg,1,0,0);
+    glColor3f(1,0.8,0.6); gluCylinder(Cylinder,0.04,0.03,l1,32,10);
+    glTranslatef(0,0,l1);
+    glColor3f(0.8,0.8,0.8); gluSphere(Sphere,0.04,32,32);
+    glRotatef(elbow_pitch_deg,0,1,0);
+    glColor3f(1,0.8,0.6); gluCylinder(Cylinder,0.03,0.025,l2,32,10);
+    glTranslatef(0,0,l2);
+    gluSphere(Sphere,0.03,32,32);
+    glRotatef(wrist_roll_deg,1,0,0);
+    glRotatef(wrist_yaw_deg,0,0,1);
+    glRotatef(wrist_pitch_deg,0,1,0);
+    glTranslatef(0,0,0.03);
+    DrawHandAndFingers;
+  glPopMatrix();
+  SwapBuffers(myDC);
+end;
+
+procedure TForm1.InitializeState;
+begin
+  // REALISM CORRECTION: Start with arm held straight out (90 deg flexion) and no bend
+  PhysicsState[0] := 0; PhysicsState[1] := 0; // Shoulder Yaw
+  PhysicsState[2] := DegToRad(90.0); PhysicsState[3] := 0.0; // Shoulder Pitch
+  PhysicsState[4] := 0; PhysicsState[5] := 0; // Elbow Pitch
+  shoulder_yaw_deg   := 0; shoulder_pitch_deg := 0; shoulder_roll_deg := 0;
+  elbow_pitch_deg    := 0; wrist_roll_deg     := 0; wrist_yaw_deg     := 0;
+  wrist_pitch_deg    := 0;
+  time := 0;
+  camera_pitch_deg := -15; camera_yaw_deg := 20; camera_roll_deg := 0;
+  TrackBarPitch.Position := -15; TrackBarYaw.Position := 20; TrackBarRoll.Position := 0;
+  UpdateCameraLabels;
+end;
+
+procedure TForm1.FormCreate(Sender: TObject);
+var i: Integer; aSeries: TLineSeries;
+begin
+  myDC := GetDC(pnlOpenGL.Handle); SetupPixelFormat(myDC);
+  myRC := wglCreateContext(myDC); wglMakeCurrent(myDC, myRC);
+  glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glEnable(GL_LIGHT0);
+  glEnable(GL_COLOR_MATERIAL); glShadeModel(GL_SMOOTH);
+  Sphere := gluNewQuadric(); Cylinder := gluNewQuadric();
+  gluQuadricNormals(Sphere, GLU_SMOOTH); gluQuadricNormals(Cylinder, GLU_SMOOTH);
+  BuildFont;
+
+  SetLength(TrajectorySeries, 7);
+  TrajectorySeries[0] := Series1; TrajectorySeries[1] := Series2; TrajectorySeries[2] := Series3;
+  for i := 3 to 6 do begin
+    aSeries := TLineSeries.Create(Self);
+    aSeries.ParentChart := ChartTrajectories;
+    TrajectorySeries[i] := aSeries;
+  end;
+  rgMode.ItemIndex := 0;
+  rgModeClick(nil);
+end;
+
+procedure TForm1.FormDestroy(Sender: TObject);
+var i: Integer;
+begin
+  glDeleteLists(FontListBase, 256);
+  for i := 3 to 6 do TrajectorySeries[i].Free;
+  gluDeleteQuadric(Sphere); gluDeleteQuadric(Cylinder);
+  wglMakeCurrent(0, 0); wglDeleteContext(myRC);
+  ReleaseDC(pnlOpenGL.Handle, myDC);
+end;
+
+procedure TForm1.FormResize(Sender: TObject);
+begin
+  if pnlOpenGL.Height = 0 then Exit;
+  glViewport(0, 0, pnlOpenGL.Width, pnlOpenGL.Height);
+  glMatrixMode(GL_PROJECTION); glLoadIdentity();
+  gluPerspective(45.0, pnlOpenGL.Width / pnlOpenGL.Height, 0.1, 100.0);
+  glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+end;
+
+procedure TForm1.Timer1Timer(Sender: TObject);
+var logStr: String; i: integer;
+begin
+  case CurrentMode of
+    smKinematic:
+    begin
+      shoulder_yaw_deg   := 45*sin(time*0.8); shoulder_pitch_deg := 30*sin(time*1.2);
+      shoulder_roll_deg  := 40*sin(time*0.5); elbow_pitch_deg    := 60*(0.5*sin(time*2.0)+0.5);
+      wrist_roll_deg     := 50*sin(time*1.5); wrist_yaw_deg      := 20*sin(time*2.5);
+      wrist_pitch_deg    := 25*sin(time*3.0);
+      for i := 0 to 6 do case i of
+          0: TrajectorySeries[i].AddXY(time, shoulder_yaw_deg); 1: TrajectorySeries[i].AddXY(time, shoulder_pitch_deg);
+          2: TrajectorySeries[i].AddXY(time, shoulder_roll_deg); 3: TrajectorySeries[i].AddXY(time, elbow_pitch_deg);
+          4: TrajectorySeries[i].AddXY(time, wrist_roll_deg); 5: TrajectorySeries[i].AddXY(time, wrist_yaw_deg);
+          6: TrajectorySeries[i].AddXY(time, wrist_pitch_deg);
+        end;
+      logStr := Format('%.2f | Kinematic | Y:%-6.1f| P:%-6.1f| R:%-6.1f| E:%-6.1f| WR:%-6.1f| WY:%-6.1f| WP:%-6.1f',
+        [time, shoulder_yaw_deg, shoulder_pitch_deg, shoulder_roll_deg, elbow_pitch_deg, wrist_roll_deg, wrist_yaw_deg, wrist_pitch_deg]);
+    end;
+    smPhysics:
+    begin
+      RungeKutta4_Step(PhysicsState, DT);
+      // REALISM ENHANCEMENT: Enforce elbow joint limit (no hyperextension)
+      if PhysicsState[4] < 0 then
+      begin
+        PhysicsState[4] := 0; // Clamp angle
+        PhysicsState[5] := -PhysicsState[5] * 0.5; // Simulate bounce
+      end;
+      shoulder_yaw_deg   := RadToDeg(PhysicsState[0]);
+      shoulder_pitch_deg := RadToDeg(PhysicsState[2]);
+      elbow_pitch_deg    := RadToDeg(PhysicsState[4]);
+      shoulder_roll_deg := 0; wrist_roll_deg := 0; wrist_yaw_deg := 0; wrist_pitch_deg := 0;
+      TrajectorySeries[0].AddXY(time, shoulder_yaw_deg);
+      TrajectorySeries[1].AddXY(time, shoulder_pitch_deg);
+      TrajectorySeries[2].AddXY(time, elbow_pitch_deg);
+      logStr := Format('%.2f | Physics   | Shoulder Yaw: %-8.2f| Shoulder Pitch: %-8.2f| Elbow Pitch: %-8.2f',
+        [time, shoulder_yaw_deg, shoulder_pitch_deg, elbow_pitch_deg]);
+    end;
+  end;
+  ListBoxLog.Items.Add(logStr);
+  ListBoxLog.ItemIndex := ListBoxLog.Items.Count - 1;
+  DrawScene;
+  time := time + DT;
+end;
+
+procedure TForm1.btnStartStopClick(Sender: TObject);
+begin
+  Timer1.Enabled := not Timer1.Enabled;
+  if Timer1.Enabled then btnStartStop.Caption := 'Stop' else btnStartStop.Caption := 'Start';
+end;
+
+procedure TForm1.btnResetClick(Sender: TObject);
+begin
+  Timer1.Enabled := False;
+  btnStartStop.Caption := 'Start';
+  rgModeClick(nil);
+end;
+
+procedure TForm1.rgModeClick(Sender: TObject);
+const
+  KinematicTitles: array[0..6] of string = ('Shoulder Yaw', 'Shoulder Pitch', 'Shoulder Roll', 'Elbow Pitch', 'Wrist Roll', 'Wrist Yaw', 'Wrist Pitch');
+  KinematicColors: array[0..6] of TColor = (clRed, clGreen, clBlue, clYellow, clPurple, clAqua, clLime);
+var i: Integer;
+begin
+  if rgMode.ItemIndex = 0 then CurrentMode := smKinematic else CurrentMode := smPhysics;
+  InitializeState;
+  for i := 0 to 6 do TrajectorySeries[i].Clear;
+  ListBoxLog.Clear;
+  ChartTrajectories.LeftAxis.Title.Caption := 'Angle (Degrees)';
+  ChartTrajectories.BottomAxis.Title.Caption := 'Time (s)';
+
+  if CurrentMode = smPhysics then
+  begin
+    ChartTrajectories.Title.Text.Clear; ChartTrajectories.Title.Text.Add('Physics Trajectories (3-DOF)');
+    ListBoxLog.Items.Add(Format('%-10s| %-11s | %-20s | %-20s | %-20s', ['Time (s)', 'Mode', 'Shoulder Yaw (Abd)', 'Shoulder Pitch (Flex)', 'Elbow Pitch (Flex)']));
+    for i := 0 to 2 do TrajectorySeries[i].Active := True; for i := 3 to 6 do TrajectorySeries[i].Active := False;
+    TrajectorySeries[0].Title:='Shoulder Yaw (Abd)'; TrajectorySeries[0].SeriesColor:=clRed;
+    TrajectorySeries[1].Title:='Shoulder Pitch (Flex)'; TrajectorySeries[1].SeriesColor:=clGreen;
+    TrajectorySeries[2].Title:='Elbow Pitch (Flex)'; TrajectorySeries[2].SeriesColor:=clBlue;
+    shoulder_yaw_deg:=RadToDeg(PhysicsState[0]);
+    shoulder_pitch_deg:=RadToDeg(PhysicsState[2]);
+    elbow_pitch_deg:=RadToDeg(PhysicsState[4]);
+  end else
+  begin
+     ChartTrajectories.Title.Text.Clear; ChartTrajectories.Title.Text.Add('Kinematic Demo (7-DOF)');
+     ListBoxLog.Items.Add(Format('%-8s|%-11s|%-10s|%-10s|%-10s|%-10s|%-10s|%-10s|%-10s',
+       ['Time (s)','Mode','Shld Yaw','Shld Pitch','Shld Roll','Elbow','WrRol','WrYaw','WrPch']));
+     for i := 0 to 6 do begin
+       TrajectorySeries[i].Active := True;
+       TrajectorySeries[i].Title := KinematicTitles[i];
+       TrajectorySeries[i].SeriesColor := KinematicColors[i];
+     end;
+  end;
+  DrawScene;
+end;
+
+procedure TForm1.BitBtnExitClick(Sender: TObject);
+begin
+  Close;
+end;
+
+procedure TForm1.UpdateCameraLabels;
+begin
+  lblPitchValue.Caption := IntToStr(TrackBarPitch.Position) + '°';
+  lblYawValue.Caption   := IntToStr(TrackBarYaw.Position) + '°';
+  lblRollValue.Caption  := IntToStr(TrackBarRoll.Position) + '°';
+end;
+
+procedure TForm1.TrackBarPitchChange(Sender: TObject);
+begin
+  camera_pitch_deg := TrackBarPitch.Position;
+  UpdateCameraLabels;
+  if not Timer1.Enabled then DrawScene;
+end;
+
+procedure TForm1.TrackBarYawChange(Sender: TObject);
+begin
+  camera_yaw_deg := TrackBarYaw.Position;
+  UpdateCameraLabels;
+  if not Timer1.Enabled then DrawScene;
+end;
+
+procedure TForm1.TrackBarRollChange(Sender: TObject);
+begin
+  camera_roll_deg := TrackBarRoll.Position;
+  UpdateCameraLabels;
+  if not Timer1.Enabled then DrawScene;
+end;
+
+procedure TForm1.cbShowAxesChange(Sender: TObject);
+begin
+  if not Timer1.Enabled then DrawScene;
+end;
+
+end.
